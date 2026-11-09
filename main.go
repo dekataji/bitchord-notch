@@ -51,6 +51,24 @@ var (
 	procCRgn = gdi32.NewProc("CreateRoundRectRgn")
 )
 
+var debugLog = func() func(string) {
+	exe, _ := os.Executable()
+	dir := filepath.Dir(exe)
+	_, statErr := os.Stat(filepath.Join(dir, "debug.on"))
+	if os.Getenv("BITCHORD_NOTCH_DEBUG") == "" && statErr != nil {
+		return func(string) {}
+	}
+	path := filepath.Join(dir, "bitchord-notch.log")
+	return func(msg string) {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		fmt.Fprintf(f, "%s %s\n", time.Now().Format("15:04:05.000"), msg)
+	}
+}()
+
 type app struct {
 	cfgPath string
 	cl      *client.Client
@@ -79,6 +97,8 @@ type app struct {
 
 	mu          sync.Mutex
 	state       *client.State
+	errText     string
+	errUntil    time.Time
 	dispPosMs   int64
 	lastTick    time.Time
 	expanded    bool
@@ -90,6 +110,7 @@ type app struct {
 }
 
 func main() {
+	debugLog("app start")
 	cfgPath := client.DefaultConfigPath()
 	cfg := client.LoadConfig(cfgPath)
 	a := &app{
@@ -146,6 +167,12 @@ func (a *app) buildWindow() error {
 	a.expBox = exp
 	exp.SetVisible(false)
 
+	a.mw.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		debugLog(fmt.Sprintf("mw raw mousedown btn=%d at %d,%d", int(button), x, y))
+	})
+	a.barBox.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		debugLog(fmt.Sprintf("bar raw mousedown btn=%d at %d,%d", int(button), x, y))
+	})
 	a.restyleWindow()
 	a.placeTopCenter(collapsedH)
 	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
@@ -383,6 +410,9 @@ func (a *app) applyState(pollErr error) {
 	if st.Current.QueuedBy != "" {
 		artist += " · queued by " + st.Current.QueuedBy
 	}
+	if a.errText != "" && time.Now().Before(a.errUntil) {
+		artist = "⚠ " + a.errText
+	}
 	a.subLbl.SetText(artist)
 	if st.Playing {
 		a.playBtn.setText("❚❚")
@@ -426,7 +456,16 @@ func (a *app) cmd(fn func(ctx context.Context) error) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		_ = fn(ctx)
+		if err := fn(ctx); err != nil {
+			debugLog("command failed: " + err.Error())
+			a.mu.Lock()
+			a.errText = shortErr(err)
+			a.errUntil = time.Now().Add(4 * time.Second)
+			a.mu.Unlock()
+			a.mw.Synchronize(func() {
+				a.subLbl.SetText("⚠ " + shortErr(err))
+			})
+		}
 		// Reflect the change quickly instead of waiting for the poll.
 		time.Sleep(250 * time.Millisecond)
 		a.pollOnce()
@@ -487,10 +526,10 @@ func shortErr(err error) string {
 func repeatLabel(r int) string {
 	switch r {
 	case 1:
-		return "🔁 all"
+		return "Repeat: all"
 	case 2:
-		return "🔂 one"
+		return "Repeat: one"
 	default:
-		return "🔁 off"
+		return "Repeat: off"
 	}
 }

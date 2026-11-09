@@ -220,14 +220,14 @@ func (a *app) buildExpanded(parent walk.Container) (*walk.Composite, error) {
 	cl2.SetMargins(walk.Margins{})
 	cl2.SetSpacing(6)
 	ctlRow.SetLayout(cl2)
-	a.shufBtn, err = newLblBtn(ctlRow, "🔀 shuffle", fontTab, func() {
+	a.shufBtn, err = newLblBtn(ctlRow, "Shuffle", fontTab, func() {
 		a.cmd(a.cl.ToggleShuffle)
 	})
 	if err != nil {
 		return nil, err
 	}
 	a.shufBtn.setSize(104, 30)
-	a.repBtn, err = newLblBtn(ctlRow, "🔁 off", fontTab, func() {
+	a.repBtn, err = newLblBtn(ctlRow, "Repeat: off", fontTab, func() {
 		a.cmd(a.cl.CycleRepeat)
 	})
 	if err != nil {
@@ -261,13 +261,12 @@ type queuePage struct {
 	a     *app
 	box   *walk.Composite
 	list  *walk.ListBox
-	model *strList
 	songs []client.Song
 	sig   string
 }
 
 func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
-	q := &queuePage{a: a, model: &strList{}}
+	q := &queuePage{a: a}
 	box, err := walk.NewComposite(parent)
 	if err != nil {
 		return nil, err
@@ -283,7 +282,6 @@ func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
 	}
 	q.list.SetFont(fontList)
 	q.list.SetBackground(brush(colPanel))
-	q.list.SetModel(q.model)
 	q.list.ItemActivated().Attach(func() {
 		i := q.list.CurrentIndex()
 		if i >= 0 {
@@ -350,8 +348,9 @@ func (q *queuePage) applyState(st *client.State) {
 		if q.sig != "nil" {
 			q.sig = "nil"
 			q.songs = nil
-			q.model.items = []string{"Nothing playing"}
-			q.list.SetModel(q.model)
+			if err := q.list.SetModel([]string{"Nothing playing"}); err != nil {
+				debugLog("queue SetModel: " + err.Error())
+			}
 		}
 		return
 	}
@@ -385,8 +384,9 @@ func (q *queuePage) applyState(st *client.State) {
 	if len(items) == 0 {
 		items = []string{"Queue is empty"}
 	}
-	q.model.items = items
-	q.list.SetModel(q.model)
+	if err := q.list.SetModel(items); err != nil {
+		debugLog("queue SetModel: " + err.Error())
+	}
 	if st.Index >= 0 && st.Index < len(items) {
 		q.list.SetCurrentIndex(st.Index)
 	}
@@ -399,7 +399,6 @@ type lyricsPage struct {
 	box        *walk.Composite
 	status     *walk.Label
 	list       *walk.ListBox
-	model      *strList
 	lyrics     *client.Lyrics
 	loadedFor  string
 	loadingFor string
@@ -407,7 +406,7 @@ type lyricsPage struct {
 }
 
 func (a *app) buildLyricsPage(parent walk.Container) (*lyricsPage, error) {
-	p := &lyricsPage{a: a, model: &strList{}, curLine: -1}
+	p := &lyricsPage{a: a, curLine: -1}
 	box, err := walk.NewComposite(parent)
 	if err != nil {
 		return nil, err
@@ -430,7 +429,6 @@ func (a *app) buildLyricsPage(parent walk.Container) (*lyricsPage, error) {
 	}
 	p.list.SetFont(fontList)
 	p.list.SetBackground(brush(colPanel))
-	p.list.SetModel(p.model)
 	p.list.ItemActivated().Attach(func() {
 		if p.lyrics == nil {
 			return
@@ -449,8 +447,7 @@ func (p *lyricsPage) showMessage(msg string) {
 	p.loadedFor = ""
 	p.curLine = -1
 	p.status.SetText(msg)
-	p.model.items = nil
-	p.list.SetModel(p.model)
+	_ = p.list.SetModel([]string{})
 }
 
 func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
@@ -459,8 +456,7 @@ func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
 	p.curLine = -1
 	if !ly.Found {
 		p.status.SetText("No lyrics found for this song.")
-		p.model.items = nil
-		p.list.SetModel(p.model)
+		_ = p.list.SetModel([]string{})
 		return
 	}
 	src := ly.Source
@@ -477,8 +473,9 @@ func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
 	for i, l := range ly.Lines {
 		items[i] = l.Text
 	}
-	p.model.items = items
-	p.list.SetModel(p.model)
+	if err := p.list.SetModel(items); err != nil {
+		debugLog("lyrics SetModel: " + err.Error())
+	}
 }
 
 func (p *lyricsPage) highlight(posMs int64) {

@@ -20,66 +20,60 @@ func brush(c walk.Color) walk.Brush {
 	return b
 }
 
-// lblBtn is a label styled as a dark button — walk's native buttons
-// cannot be recoloured, and the notch is a dark custom surface.
+// lblBtn is a button built on a native walk.PushButton. (An earlier
+// version used a Composite+Label pair with MouseDown handlers: those
+// handlers never fired — verified dead both on the user's Windows and
+// under Wine — while native BUTTON controls receive clicks reliably.
+// The dark custom styling is traded for buttons that work.)
 type lblBtn struct {
-	box    *walk.Composite
-	label  *walk.Label
-	active bool
-	onHit  func()
+	box     *walk.PushButton
+	font    *walk.Font
+	fontB   *walk.Font
+	active  bool
+	baseTxt string
 }
 
 func newLblBtn(parent walk.Container, text string, font *walk.Font, onHit func()) (*lblBtn, error) {
-	box, err := walk.NewComposite(parent)
+	pb, err := walk.NewPushButton(parent)
 	if err != nil {
 		return nil, err
 	}
-	box.SetBackground(brush(colBtn))
-	l := walk.NewVBoxLayout()
-	l.SetMargins(walk.Margins{HNear: 6, VNear: 2, HFar: 6, VFar: 2})
-	l.SetSpacing(0)
-	box.SetLayout(l)
-	lbl, err := walk.NewLabel(box)
-	if err != nil {
-		return nil, err
-	}
-	lbl.SetText(text)
-	lbl.SetFont(font)
-	lbl.SetTextColor(colText)
-	lbl.SetTextAlignment(walk.AlignCenter)
-	b := &lblBtn{box: box, label: lbl, onHit: onHit}
-	hit := func(x, y int, button walk.MouseButton) {
-		if button == walk.LeftButton && b.onHit != nil {
-			b.onHit()
+	pb.SetText(text)
+	pb.SetFont(font)
+	b := &lblBtn{box: pb, font: font, baseTxt: text}
+	if font != nil {
+		if fb, err := walk.NewFont(font.Family(), font.PointSize(), walk.FontBold); err == nil {
+			b.fontB = fb
 		}
 	}
-	box.MouseDown().Attach(hit)
-	lbl.MouseDown().Attach(hit)
+	pb.Clicked().Attach(func() {
+		debugLog("button clicked: " + b.baseTxt)
+		if onHit != nil {
+			onHit()
+		}
+	})
 	return b, nil
 }
 
-func (b *lblBtn) setText(s string) { b.label.SetText(s) }
+func (b *lblBtn) setText(s string) {
+	b.baseTxt = s
+	b.box.SetText(s)
+}
 
+// setActive marks the button by bolding it (native buttons cannot be
+// recoloured under the Windows theme).
 func (b *lblBtn) setActive(on bool) {
 	b.active = on
-	if on {
-		b.label.SetTextColor(colAmber)
-		b.box.SetBackground(brush(colBtnHi))
+	if on && b.fontB != nil {
+		b.box.SetFont(b.fontB)
 	} else {
-		b.label.SetTextColor(colText)
-		b.box.SetBackground(brush(colBtn))
+		b.box.SetFont(b.font)
 	}
 }
 
 func (b *lblBtn) setSize(w, h int) {
 	b.box.SetMinMaxSize(walk.Size{Width: w, Height: h}, walk.Size{Width: w, Height: h})
 }
-
-// strList is a walk.ListModel over plain strings.
-type strList struct{ items []string }
-
-func (m *strList) ItemCount() int              { return len(m.items) }
-func (m *strList) Value(index int) interface{} { return m.items[index] }
 
 func dragOn(w walk.Window, hwnd uintptr) {
 	w.MouseDown().Attach(func(x, y int, button walk.MouseButton) {

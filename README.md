@@ -50,3 +50,20 @@ go test ./client/ # protocol tests (stub phone + relay prefix)
 - `client/` — the remote API client (unlock/session, state, commands,
   lyrics) + config persistence. Platform-neutral and unit-tested.
 - `main.go`, `pages.go`, `widgets.go` — the notch UI (walk / Win32).
+- `third_party/walk` — a vendored copy of lxn/walk with three
+  nil-guards in `mainwindow.go`: under Wine, a WM_SIZE arrives while
+  the window is still being created, before `statusBar`/`menu` exist,
+  and stock walk dereferences them and crashes. The guards are
+  no-ops on native Windows.
+- `test/stub_phone.py` — a stub of the phone API used to test the
+  real exe end-to-end under Wine (Xvfb + xdotool) on a headless box.
+
+Two walk lessons baked into the code (both bit v0.1.0 in the field):
+buttons are native `PushButton`s because `MouseDown` handlers on
+label/composite pairs never fired, and list boxes are fed plain
+`[]string` models because a hand-rolled model that only implements
+`ItemCount`/`Value` silently yields an empty list (walk's
+`ListModel` also requires the change-event methods).
+
+Debug logging: drop an empty `debug.on` file next to the exe and the
+app writes `bitchord-notch.log` (button clicks, command failures).
