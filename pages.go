@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/lxn/walk"
@@ -10,21 +11,57 @@ import (
 	"bitchord-notch/client"
 )
 
-// ── collapsed bar ───────────────────────────────────────────────────
+// Layout constants (logical units). The expanded window is
+// collapsedH + expandedExtra tall; the page height is what's left
+// after the tabs row and the footer, and the list heights are pinned
+// exactly — a walk ListBox otherwise grows its minimum height with
+// the item count (ensureVisibleItemsHeight) and pushes the footer
+// off the bottom of the window, which is what cropped v0.1.1 with a
+// real 14-song queue.
+const (
+	expandedH   = 500
+	tabsH       = 34
+	seekRowH    = 26
+	ctlRowH     = 30
+	pageH       = expandedH - collapsedH - tabsH - seekRowH - ctlRowH - 12 - 18
+	queueListH  = pageH - 36 // actions row + spacing
+	lyricsListH = pageH - 24 // status row + spacing
+	stripH      = 4
+)
+
+// ── collapsed bar (+ pill strip) ────────────────────────────────────
 
 type barWidgets struct {
+	wrap  *walk.Composite
 	box   *walk.Composite
+	strip *progStrip
 	title *walk.Label
 	sub   *walk.Label
-	play  *lblBtn
+	prev  *chip
+	play  *chip
+	next  *chip
+	chev  *chip
 	time  *walk.Label
 }
 
 func (a *app) buildBar() (*barWidgets, error) {
-	box, err := walk.NewComposite(a.mw)
+	w := &barWidgets{}
+	wrap, err := walk.NewComposite(a.mw)
 	if err != nil {
 		return nil, err
 	}
+	w.wrap = wrap
+	wl := walk.NewVBoxLayout()
+	wl.SetMargins(walk.Margins{})
+	wl.SetSpacing(0)
+	wrap.SetLayout(wl)
+	wrap.SetBackground(brush(colBG))
+
+	box, err := walk.NewComposite(wrap)
+	if err != nil {
+		return nil, err
+	}
+	w.box = box
 	box.SetBackground(brush(colBG))
 	lay := walk.NewHBoxLayout()
 	lay.SetMargins(walk.Margins{HNear: 10, VNear: 6, HFar: 10, VFar: 6})
@@ -33,21 +70,22 @@ func (a *app) buildBar() (*barWidgets, error) {
 	box.SetMinMaxSize(walk.Size{Width: notchW, Height: collapsedH},
 		walk.Size{Width: notchW, Height: collapsedH})
 
-	prev, err := newLblBtn(box, "⏮", fontBtn, func() { a.cmd(a.cl.Prev) })
-	if err != nil {
+	if w.prev, err = a.newChip(box, "⏮", fontBtn, func() { a.cmd(a.cl.Prev) }); err != nil {
 		return nil, err
 	}
-	prev.setSize(40, 44)
-	play, err := newLblBtn(box, "▶", fontBtn, func() { a.cmd(a.cl.Toggle) })
-	if err != nil {
+	w.prev.round = true
+	w.prev.setSize(40, 40)
+	if w.play, err = a.newChip(box, "▶", fontBtn, func() { a.cmd(a.cl.Toggle) }); err != nil {
 		return nil, err
 	}
-	play.setSize(46, 44)
-	next, err := newLblBtn(box, "⏭", fontBtn, func() { a.cmd(a.cl.Next) })
-	if err != nil {
+	w.play.primary = true
+	w.play.round = true
+	w.play.setSize(44, 44)
+	if w.next, err = a.newChip(box, "⏭", fontBtn, func() { a.cmd(a.cl.Next) }); err != nil {
 		return nil, err
 	}
-	next.setSize(40, 44)
+	w.next.round = true
+	w.next.setSize(40, 40)
 
 	mid, err := walk.NewComposite(box)
 	if err != nil {
@@ -59,44 +97,45 @@ func (a *app) buildBar() (*barWidgets, error) {
 	ml.SetMargins(walk.Margins{HNear: 4})
 	ml.SetSpacing(0)
 	mid.SetLayout(ml)
-	title, err := walk.NewLabel(mid)
-	if err != nil {
+	if w.title, err = walk.NewLabel(mid); err != nil {
 		return nil, err
 	}
-	title.SetText("BitChord Notch")
-	title.SetFont(fontTitle)
-	title.SetTextColor(colText)
-	title.SetEllipsisMode(walk.EllipsisEnd)
-	sub, err := walk.NewLabel(mid)
-	if err != nil {
+	w.title.SetText("BitChord Notch")
+	w.title.SetFont(fontTitle)
+	w.title.SetTextColor(colText)
+	w.title.SetEllipsisMode(walk.EllipsisEnd)
+	if w.sub, err = walk.NewLabel(mid); err != nil {
 		return nil, err
 	}
-	sub.SetText("connecting…")
-	sub.SetFont(fontSub)
-	sub.SetTextColor(colDim)
+	w.sub.SetText("connecting…")
+	w.sub.SetFont(fontSub)
+	w.sub.SetTextColor(colMuted)
 
-	tim, err := walk.NewLabel(box)
-	if err != nil {
+	if w.time, err = walk.NewLabel(box); err != nil {
 		return nil, err
 	}
-	tim.SetFont(fontSub)
-	tim.SetTextColor(colDim)
-	tim.SetTextAlignment(walk.AlignFar)
-	tim.SetMinMaxSize(walk.Size{Width: 88, Height: 20},
+	w.time.SetFont(fontSub)
+	w.time.SetTextColor(colMuted)
+	w.time.SetTextAlignment(walk.AlignFar)
+	w.time.SetMinMaxSize(walk.Size{Width: 88, Height: 20},
 		walk.Size{Width: 88, Height: 20})
 
-	chev, err := newLblBtn(box, "▾", fontBtn, func() { a.setExpanded(!a.expanded) })
-	if err != nil {
+	if w.chev, err = a.newChip(box, "▾", fontBtn, func() { a.setExpanded(true) }); err != nil {
 		return nil, err
 	}
-	chev.setSize(36, 44)
+	w.chev.setSize(36, 44)
+
+	// Pill progress strip: a thin mint bar along the bottom edge.
+	if w.strip, err = a.newProgStrip(wrap); err != nil {
+		return nil, err
+	}
 
 	hwnd := uintptr(a.mw.Handle())
 	dragOn(box, hwnd)
 	dragOn(mid, hwnd)
-	dragOn(title, hwnd)
-	dragOn(sub, hwnd)
-	return &barWidgets{box: box, title: title, sub: sub, play: play, time: tim}, nil
+	dragOn(w.title, hwnd)
+	dragOn(w.sub, hwnd)
+	return w, nil
 }
 
 // ── expanded area ───────────────────────────────────────────────────
@@ -111,41 +150,49 @@ func (a *app) buildExpanded(parent walk.Container) (*walk.Composite, error) {
 	lay.SetMargins(walk.Margins{HNear: 10, VNear: 2, HFar: 10, VFar: 10})
 	lay.SetSpacing(6)
 	exp.SetLayout(lay)
+	// No fixed height here: the children pin their own heights, and
+	// a fixed minimum would be reserved even while the box is hidden
+	// in pill mode, keeping the window tall.
+	exp.SetMinMaxSize(walk.Size{Width: notchW, Height: 1},
+		walk.Size{Width: notchW, Height: 100000})
 
 	// Tabs row.
 	tabs, err := walk.NewComposite(exp)
 	if err != nil {
 		return nil, err
 	}
+	a.tabsRow = tabs
 	tl := walk.NewHBoxLayout()
 	tl.SetMargins(walk.Margins{})
 	tl.SetSpacing(6)
 	tabs.SetLayout(tl)
-	a.tabQueue, err = newLblBtn(tabs, "Queue", fontTab, func() { a.showTab("queue") })
-	if err != nil {
+	mkTab := func(text, name string) (*chip, error) {
+		c, err := a.newChip(tabs, text, fontTab, func() { a.showTab(name) })
+		if err != nil {
+			return nil, err
+		}
+		c.toggle = true
+		c.setSize(84, tabsH)
+		return c, nil
+	}
+	if a.tabQueue, err = mkTab("Queue", "queue"); err != nil {
 		return nil, err
 	}
-	a.tabQueue.setSize(84, 34)
-	a.tabLyr, err = newLblBtn(tabs, "Lyrics", fontTab, func() { a.showTab("lyrics") })
-	if err != nil {
+	if a.tabLyr, err = mkTab("Lyrics", "lyrics"); err != nil {
 		return nil, err
 	}
-	a.tabLyr.setSize(84, 34)
-	a.tabSet, err = newLblBtn(tabs, "Settings", fontTab, func() { a.showTab("settings") })
-	if err != nil {
+	if a.tabSet, err = mkTab("Settings", "settings"); err != nil {
 		return nil, err
 	}
-	a.tabSet.setSize(84, 34)
 	spacer, err := walk.NewComposite(tabs)
 	if err != nil {
 		return nil, err
 	}
-	_ = spacer
-	collapse, err := newLblBtn(tabs, "▴", fontBtn, func() { a.setExpanded(false) })
-	if err != nil {
+	_ = tl.SetStretchFactor(spacer, 1)
+	if a.collapseBtn, err = a.newChip(tabs, "▴", fontBtn, func() { a.setExpanded(false) }); err != nil {
 		return nil, err
 	}
-	collapse.setSize(36, 34)
+	a.collapseBtn.setSize(36, tabsH)
 
 	// Pages.
 	a.pageBox, err = walk.NewComposite(exp)
@@ -156,6 +203,8 @@ func (a *app) buildExpanded(parent walk.Container) (*walk.Composite, error) {
 	pl.SetMargins(walk.Margins{})
 	pl.SetSpacing(0)
 	a.pageBox.SetLayout(pl)
+	a.pageBox.SetMinMaxSize(walk.Size{Width: notchW - 20, Height: pageH},
+		walk.Size{Width: notchW - 20, Height: pageH})
 	if a.queuePage, err = a.buildQueuePage(a.pageBox); err != nil {
 		return nil, err
 	}
@@ -166,81 +215,64 @@ func (a *app) buildExpanded(parent walk.Container) (*walk.Composite, error) {
 		return nil, err
 	}
 
-	// Footer: seek bar then transport extras.
+	// Footer: seek row, then transport extras.
 	seekRow, err := walk.NewComposite(exp)
 	if err != nil {
 		return nil, err
 	}
+	a.seekRowW = seekRow
 	sl := walk.NewHBoxLayout()
 	sl.SetMargins(walk.Margins{})
 	sl.SetSpacing(6)
 	seekRow.SetLayout(sl)
-	back, err := newLblBtn(seekRow, "−10s", fontTab, func() {
+	back, err := a.newChip(seekRow, "−10s", fontTab, func() {
 		a.cmd(func(ctx context.Context) error { return a.cl.Seek(ctx, a.dispPosMs-10_000) })
 	})
 	if err != nil {
 		return nil, err
 	}
-	back.setSize(48, 26)
-	a.progBar, err = walk.NewProgressBar(seekRow)
-	if err != nil {
+	back.setSize(48, seekRowH)
+	if a.seekW, err = a.newSeekBar(seekRow); err != nil {
 		return nil, err
 	}
-	a.progBar.SetRange(0, 1)
-	a.progBar.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
-		if button != walk.LeftButton {
-			return
-		}
-		a.mu.Lock()
-		st := a.state
-		a.mu.Unlock()
-		if st == nil || st.DurationMs <= 0 {
-			return
-		}
-		w := a.progBar.Size().Width
-		if w <= 0 {
-			return
-		}
-		ms := int64(float64(x) / float64(w) * float64(st.DurationMs))
-		a.cmd(func(ctx context.Context) error { return a.cl.Seek(ctx, ms) })
-	})
-	fwd, err := newLblBtn(seekRow, "+10s", fontTab, func() {
+	fwd, err := a.newChip(seekRow, "+10s", fontTab, func() {
 		a.cmd(func(ctx context.Context) error { return a.cl.Seek(ctx, a.dispPosMs+10_000) })
 	})
 	if err != nil {
 		return nil, err
 	}
-	fwd.setSize(48, 26)
+	fwd.setSize(48, seekRowH)
 
 	ctlRow, err := walk.NewComposite(exp)
 	if err != nil {
 		return nil, err
 	}
+	a.ctlRowW = ctlRow
 	cl2 := walk.NewHBoxLayout()
 	cl2.SetMargins(walk.Margins{})
 	cl2.SetSpacing(6)
 	ctlRow.SetLayout(cl2)
-	a.shufBtn, err = newLblBtn(ctlRow, "Shuffle", fontTab, func() {
+	if a.shufBtn, err = a.newChip(ctlRow, "Shuffle", fontTab, func() {
 		a.cmd(a.cl.ToggleShuffle)
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
-	a.shufBtn.setSize(104, 30)
-	a.repBtn, err = newLblBtn(ctlRow, "Repeat: off", fontTab, func() {
+	a.shufBtn.toggle = true
+	a.shufBtn.setSize(104, ctlRowH)
+	if a.repBtn, err = a.newChip(ctlRow, "Repeat: off", fontTab, func() {
 		a.cmd(a.cl.CycleRepeat)
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
-	a.repBtn.setSize(104, 30)
+	a.repBtn.toggle = true
+	a.repBtn.setSize(110, ctlRowH)
 	volLbl, err := walk.NewLabel(ctlRow)
 	if err != nil {
 		return nil, err
 	}
 	volLbl.SetText("Vol")
 	volLbl.SetFont(fontTab)
-	volLbl.SetTextColor(colDim)
+	volLbl.SetTextColor(colMuted)
 	a.volSlider, err = walk.NewSlider(ctlRow)
 	if err != nil {
 		return nil, err
@@ -258,11 +290,12 @@ func (a *app) buildExpanded(parent walk.Container) (*walk.Composite, error) {
 // ── queue page ──────────────────────────────────────────────────────
 
 type queuePage struct {
-	a     *app
-	box   *walk.Composite
-	list  *walk.ListBox
-	songs []client.Song
-	sig   string
+	a       *app
+	box     *walk.Composite
+	list    *walk.ListBox
+	actions *walk.Composite
+	songs   []client.Song
+	sig     string
 }
 
 func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
@@ -282,6 +315,7 @@ func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
 	}
 	q.list.SetFont(fontList)
 	q.list.SetBackground(brush(colPanel))
+	pinListHeight(q.list, queueListH)
 	q.list.ItemActivated().Attach(func() {
 		i := q.list.CurrentIndex()
 		if i >= 0 {
@@ -292,12 +326,13 @@ func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
 	if err != nil {
 		return nil, err
 	}
+	q.actions = row
 	rl := walk.NewHBoxLayout()
 	rl.SetMargins(walk.Margins{})
 	rl.SetSpacing(6)
 	row.SetLayout(rl)
-	mk := func(text string, fn func(i int)) (*lblBtn, error) {
-		return newLblBtn(row, text, fontTab, func() {
+	mk := func(text string, fn func(i int)) (*chip, error) {
+		return a.newChip(row, text, fontTab, func() {
 			if i := q.list.CurrentIndex(); i >= 0 {
 				fn(i)
 			}
@@ -343,6 +378,13 @@ func (a *app) buildQueuePage(parent walk.Container) (*queuePage, error) {
 	return q, nil
 }
 
+// pinListHeight fixes a list box's height so walk's item-count-based
+// height adjustment cannot push siblings off the window.
+func pinListHeight(lb *walk.ListBox, h int) {
+	lb.SetMinMaxSize(walk.Size{Width: 1, Height: h},
+		walk.Size{Width: 100000, Height: h})
+}
+
 func (q *queuePage) applyState(st *client.State) {
 	if st == nil {
 		if q.sig != "nil" {
@@ -351,6 +393,7 @@ func (q *queuePage) applyState(st *client.State) {
 			if err := q.list.SetModel([]string{"Nothing playing"}); err != nil {
 				debugLog("queue SetModel: " + err.Error())
 			}
+			pinListHeight(q.list, queueListH)
 		}
 		return
 	}
@@ -390,6 +433,7 @@ func (q *queuePage) applyState(st *client.State) {
 	if st.Index >= 0 && st.Index < len(items) {
 		q.list.SetCurrentIndex(st.Index)
 	}
+	pinListHeight(q.list, queueListH)
 }
 
 // ── lyrics page ─────────────────────────────────────────────────────
@@ -422,13 +466,16 @@ func (a *app) buildLyricsPage(parent walk.Container) (*lyricsPage, error) {
 	}
 	p.status.SetText("Lyrics appear here when a song plays.")
 	p.status.SetFont(fontSub)
-	p.status.SetTextColor(colDim)
+	p.status.SetTextColor(colMuted)
+	p.status.SetMinMaxSize(walk.Size{Width: 1, Height: 18},
+		walk.Size{Width: 100000, Height: 18})
 	p.list, err = walk.NewListBox(box)
 	if err != nil {
 		return nil, err
 	}
 	p.list.SetFont(fontList)
 	p.list.SetBackground(brush(colPanel))
+	pinListHeight(p.list, lyricsListH)
 	p.list.ItemActivated().Attach(func() {
 		if p.lyrics == nil {
 			return
@@ -448,6 +495,7 @@ func (p *lyricsPage) showMessage(msg string) {
 	p.curLine = -1
 	p.status.SetText(msg)
 	_ = p.list.SetModel([]string{})
+	pinListHeight(p.list, lyricsListH)
 }
 
 func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
@@ -457,6 +505,7 @@ func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
 	if !ly.Found {
 		p.status.SetText("No lyrics found for this song.")
 		_ = p.list.SetModel([]string{})
+		pinListHeight(p.list, lyricsListH)
 		return
 	}
 	src := ly.Source
@@ -476,6 +525,7 @@ func (p *lyricsPage) setLyrics(ly *client.Lyrics) {
 	if err := p.list.SetModel(items); err != nil {
 		debugLog("lyrics SetModel: " + err.Error())
 	}
+	pinListHeight(p.list, lyricsListH)
 }
 
 func (p *lyricsPage) highlight(posMs int64) {
@@ -499,13 +549,20 @@ func (p *lyricsPage) highlight(posMs int64) {
 // ── settings page ───────────────────────────────────────────────────
 
 type settingsPage struct {
-	a      *app
-	box    *walk.Composite
-	urlEd  *walk.LineEdit
-	tokEd  *walk.LineEdit
-	pinEd  *walk.LineEdit
-	nameEd *walk.LineEdit
-	status *walk.Label
+	a       *app
+	box     *walk.Composite
+	urlEd   *walk.LineEdit
+	tokEd   *walk.LineEdit
+	pinEd   *walk.LineEdit
+	nameEd  *walk.LineEdit
+	autoTgl *chip
+	progTgl *chip
+	ctlTgl  *chip
+	delayEd *walk.LineEdit
+	autoOn  bool
+	progOn  bool
+	ctlOn   bool
+	status  *walk.Label
 }
 
 func (a *app) buildSettingsPage(parent walk.Container) (*settingsPage, error) {
@@ -520,41 +577,51 @@ func (a *app) buildSettingsPage(parent walk.Container) (*settingsPage, error) {
 	lay.SetSpacing(6)
 	box.SetLayout(lay)
 	cfg := a.cl.Config()
-	row := func(label string, val string, password bool) (*walk.LineEdit, error) {
-		lbl, err := walk.NewLabel(box)
+
+	field := func(label string, val string, password bool) (*walk.LineEdit, error) {
+		row, err := walk.NewComposite(box)
+		if err != nil {
+			return nil, err
+		}
+		rl := walk.NewHBoxLayout()
+		rl.SetMargins(walk.Margins{})
+		rl.SetSpacing(8)
+		row.SetLayout(rl)
+		lbl, err := walk.NewLabel(row)
 		if err != nil {
 			return nil, err
 		}
 		lbl.SetText(label)
 		lbl.SetFont(fontSub)
-		lbl.SetTextColor(colDim)
-		lbl.SetMinMaxSize(walk.Size{Width: 0, Height: 15},
-			walk.Size{Width: 10000, Height: 15})
-		ed, err := walk.NewLineEdit(box)
+		lbl.SetTextColor(colMuted)
+		lbl.SetMinMaxSize(walk.Size{Width: 168, Height: 27},
+			walk.Size{Width: 168, Height: 27})
+		ed, err := walk.NewLineEdit(row)
 		if err != nil {
 			return nil, err
 		}
 		ed.SetFont(fontForm)
 		ed.SetText(val)
-		ed.SetMinMaxSize(walk.Size{Width: 0, Height: 27},
+		ed.SetMinMaxSize(walk.Size{Width: 1, Height: 27},
 			walk.Size{Width: 10000, Height: 27})
 		if password {
 			ed.SetPasswordMode(true)
 		}
 		return ed, nil
 	}
-	if p.urlEd, err = row("Relay URL (or phone LAN address)", cfg.BaseURL, false); err != nil {
+	if p.urlEd, err = field("Relay URL (or phone LAN)", cfg.BaseURL, false); err != nil {
 		return nil, err
 	}
-	if p.tokEd, err = row("Relay token (blank for direct LAN mode)", cfg.RelayToken, false); err != nil {
+	if p.tokEd, err = field("Relay token (blank = LAN)", cfg.RelayToken, false); err != nil {
 		return nil, err
 	}
-	if p.pinEd, err = row("Remote PIN", cfg.PIN, true); err != nil {
+	if p.pinEd, err = field("Remote PIN", cfg.PIN, true); err != nil {
 		return nil, err
 	}
-	if p.nameEd, err = row("Your name (shown on the phone)", cfg.Name, false); err != nil {
+	if p.nameEd, err = field("Your name (on the phone)", cfg.Name, false); err != nil {
 		return nil, err
 	}
+
 	saveRow, err := walk.NewComposite(box)
 	if err != nil {
 		return nil, err
@@ -563,26 +630,92 @@ func (a *app) buildSettingsPage(parent walk.Container) (*settingsPage, error) {
 	srl.SetMargins(walk.Margins{})
 	srl.SetSpacing(0)
 	saveRow.SetLayout(srl)
-	save, err := newLblBtn(saveRow, "Save & connect", fontTab, func() { p.save() })
+	save, err := a.newChip(saveRow, "Save & connect", fontTab, func() { p.save() })
 	if err != nil {
 		return nil, err
 	}
-	save.setSize(140, 32)
-	rowSpacer, err := walk.NewComposite(saveRow)
-	if err != nil {
+	save.setSize(140, 30)
+	if _, err = walk.NewComposite(saveRow); err != nil {
 		return nil, err
 	}
-	_ = srl.SetStretchFactor(rowSpacer, 1)
+
 	p.status, err = walk.NewLabel(box)
 	if err != nil {
 		return nil, err
 	}
 	p.status.SetFont(fontSub)
-	p.status.SetTextColor(colDim)
+	p.status.SetTextColor(colMuted)
 	p.status.SetMinMaxSize(walk.Size{Width: 0, Height: 15},
 		walk.Size{Width: 10000, Height: 15})
-	// The form is fixed-height content: a trailing spacer takes any
-	// slack in the page instead of the layout stretching the fields.
+
+	// Notch behaviour.
+	p.autoOn = cfg.AutoCollapseOn()
+	p.progOn = cfg.PillProgressOn()
+	p.ctlOn = cfg.PillControlsOn()
+	autoRow, err := walk.NewComposite(box)
+	if err != nil {
+		return nil, err
+	}
+	arl := walk.NewHBoxLayout()
+	arl.SetMargins(walk.Margins{})
+	arl.SetSpacing(6)
+	autoRow.SetLayout(arl)
+	if p.autoTgl, err = a.newChip(autoRow, "", fontTab, func() {
+		p.autoOn = !p.autoOn
+		p.refreshToggles()
+	}); err != nil {
+		return nil, err
+	}
+	p.autoTgl.toggle = true
+	p.autoTgl.left = true
+	p.autoTgl.setSize(300, 24)
+	dLbl, err := walk.NewLabel(autoRow)
+	if err != nil {
+		return nil, err
+	}
+	dLbl.SetText("delay")
+	dLbl.SetFont(fontSub)
+	dLbl.SetTextColor(colMuted)
+	p.delayEd, err = walk.NewLineEdit(autoRow)
+	if err != nil {
+		return nil, err
+	}
+	p.delayEd.SetFont(fontForm)
+	delayTxt := "0.6"
+	if cfg.CollapseDelayMs > 0 {
+		delayTxt = strconv.FormatFloat(float64(cfg.CollapseDelayMs)/1000, 'f', -1, 64)
+	}
+	p.delayEd.SetText(delayTxt)
+	p.delayEd.SetMinMaxSize(walk.Size{Width: 44, Height: 24},
+		walk.Size{Width: 44, Height: 24})
+	sLbl, err := walk.NewLabel(autoRow)
+	if err != nil {
+		return nil, err
+	}
+	sLbl.SetText("s")
+	sLbl.SetFont(fontSub)
+	sLbl.SetTextColor(colMuted)
+	if p.progTgl, err = a.newChip(box, "", fontTab, func() {
+		p.progOn = !p.progOn
+		p.refreshToggles()
+	}); err != nil {
+		return nil, err
+	}
+	p.progTgl.toggle = true
+	p.progTgl.left = true
+	p.progTgl.setSize(330, 24)
+	if p.ctlTgl, err = a.newChip(box, "", fontTab, func() {
+		p.ctlOn = !p.ctlOn
+		p.refreshToggles()
+	}); err != nil {
+		return nil, err
+	}
+	p.ctlTgl.toggle = true
+	p.ctlTgl.left = true
+	p.ctlTgl.setSize(330, 24)
+	p.refreshToggles()
+
+	// Trailing spacer absorbs slack so rows never stretch.
 	spacer, err := walk.NewComposite(box)
 	if err != nil {
 		return nil, err
@@ -591,14 +724,36 @@ func (a *app) buildSettingsPage(parent walk.Container) (*settingsPage, error) {
 	return p, nil
 }
 
+func (p *settingsPage) refreshToggles() {
+	set := func(c *chip, on bool, text string) {
+		prefix := "○  "
+		if on {
+			prefix = "●  "
+		}
+		c.setText(prefix + text)
+		c.setActive(on)
+	}
+	set(p.autoTgl, p.autoOn, "Auto-collapse on mouse leave")
+	set(p.progTgl, p.progOn, "Pill: show the progress bar")
+	set(p.ctlTgl, p.ctlOn, "Pill: show transport controls")
+}
+
 func (p *settingsPage) setStatus(s string) { p.status.SetText(s) }
 
 func (p *settingsPage) save() {
+	delayMs := 600
+	if v, err := strconv.ParseFloat(strings.TrimSpace(p.delayEd.Text()), 64); err == nil && v >= 0 && v <= 5 {
+		delayMs = int(v * 1000)
+	}
 	cfg := client.Config{
-		BaseURL:    strings.TrimSpace(p.urlEd.Text()),
-		RelayToken: strings.TrimSpace(p.tokEd.Text()),
-		PIN:        strings.TrimSpace(p.pinEd.Text()),
-		Name:       strings.TrimSpace(p.nameEd.Text()),
+		BaseURL:         strings.TrimSpace(p.urlEd.Text()),
+		RelayToken:      strings.TrimSpace(p.tokEd.Text()),
+		PIN:             strings.TrimSpace(p.pinEd.Text()),
+		Name:            strings.TrimSpace(p.nameEd.Text()),
+		AutoCollapse:    &p.autoOn,
+		PillProgress:    &p.progOn,
+		PillControls:    &p.ctlOn,
+		CollapseDelayMs: delayMs,
 	}
 	p.a.cl.SetConfig(cfg)
 	if err := client.SaveConfig(p.a.cfgPath, cfg); err != nil {
@@ -606,5 +761,6 @@ func (p *settingsPage) save() {
 		return
 	}
 	p.setStatus("Saved — connecting…")
+	p.a.onSettingsSaved()
 	go p.a.pollOnce()
 }

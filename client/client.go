@@ -34,6 +34,40 @@ type Config struct {
 	RelayToken string `json:"relayToken"` // empty = direct LAN mode
 	PIN        string `json:"pin"`
 	Name       string `json:"name"` // label shown in the phone's user list
+
+	// Notch behaviour. Pointers so an absent key (older config
+	// files) resolves to the default instead of false.
+	AutoCollapse    *bool `json:"autoCollapse,omitempty"`
+	PillProgress    *bool `json:"pillProgress,omitempty"`
+	PillControls    *bool `json:"pillControls,omitempty"`
+	CollapseDelayMs int   `json:"collapseDelayMs,omitempty"`
+}
+
+func boolOr(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+// AutoCollapseOn defaults to true.
+func (c Config) AutoCollapseOn() bool { return boolOr(c.AutoCollapse, true) }
+
+// PillProgressOn defaults to true.
+func (c Config) PillProgressOn() bool { return boolOr(c.PillProgress, true) }
+
+// PillControlsOn defaults to true.
+func (c Config) PillControlsOn() bool { return boolOr(c.PillControls, true) }
+
+// CollapseDelay defaults to 600 ms, clamped to [0, 5 s].
+func (c Config) CollapseDelay() time.Duration {
+	if c.CollapseDelayMs <= 0 {
+		return 600 * time.Millisecond
+	}
+	if c.CollapseDelayMs > 5000 {
+		return 5 * time.Second
+	}
+	return time.Duration(c.CollapseDelayMs) * time.Millisecond
 }
 
 func (c Config) Ready() bool {

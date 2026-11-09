@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -28,18 +29,26 @@ import (
 //go:embed icon.ico
 var iconICO []byte
 
+// Design tokens from the Remote page (remote_player.html in the
+// BitChord fork): deep blue-black surfaces, mint accent.
 var (
-	colBG      = walk.RGB(16, 18, 20)
-	colPanel   = walk.RGB(23, 25, 29)
-	colBtn     = walk.RGB(38, 41, 46)
-	colBtnHi   = walk.RGB(52, 56, 62)
-	colText    = walk.RGB(255, 255, 255)
-	colDim     = walk.RGB(154, 160, 166)
-	colAmber   = walk.RGB(255, 179, 0)
-	colDanger  = walk.RGB(229, 72, 77)
+	colBG      = walk.RGB(0x0B, 0x0E, 0x14)
+	colPanel   = walk.RGB(0x15, 0x1A, 0x23)
+	colPanel2  = walk.RGB(0x1C, 0x23, 0x30)
+	colBorder  = walk.RGB(0x26, 0x2F, 0x42)
+	colHover   = walk.RGB(0x23, 0x2B, 0x3C)
+	colText    = walk.RGB(0xE8, 0xEC, 0xF4)
+	colMuted   = walk.RGB(0x8B, 0x94, 0xA7)
+	colMint    = walk.RGB(0x69, 0xF0, 0xAE)
+	colMintHi  = walk.RGB(0x8C, 0xF5, 0xC3)
+	colMintInk = walk.RGB(0x06, 0x28, 0x1A)
+	colSky     = walk.RGB(0x4F, 0xC3, 0xF7)
+	colDanger  = walk.RGB(0xFF, 0x5C, 0x7A)
+)
+
+const (
 	notchW     = 500
 	collapsedH = 58
-	expandedH  = 500
 )
 
 var (
@@ -49,7 +58,14 @@ var (
 	procSend = user32.NewProc("SendMessageW")
 	procRgn  = user32.NewProc("SetWindowRgn")
 	procCRgn = gdi32.NewProc("CreateRoundRectRgn")
+
+	procCursorPos  = user32.NewProc("GetCursorPos")
+	procWindowRect = user32.NewProc("GetWindowRect")
+	procGetFocus   = user32.NewProc("GetFocus")
 )
+
+type winPoint struct{ X, Y int32 }
+type winRect struct{ Left, Top, Right, Bottom int32 }
 
 var debugLog = func() func(string) {
 	exe, _ := os.Executable()
@@ -72,24 +88,31 @@ var debugLog = func() func(string) {
 type app struct {
 	cfgPath string
 	cl      *client.Client
+	chips   []*chip
 
 	mw       *walk.MainWindow
 	ni       *walk.NotifyIcon
-	barBox   *walk.Composite
+	bar      *barWidgets
 	titleLbl *walk.Label
 	subLbl   *walk.Label
-	playBtn  *lblBtn
 	timeLbl  *walk.Label
 
-	expBox    *walk.Composite
-	tabQueue  *lblBtn
-	tabLyr    *lblBtn
-	tabSet    *lblBtn
-	pageBox   *walk.Composite
-	progBar   *walk.ProgressBar
-	volSlider *walk.Slider
-	shufBtn   *lblBtn
-	repBtn    *lblBtn
+	expBox      *walk.Composite
+	tabQueue    *chip
+	tabLyr      *chip
+	tabSet      *chip
+	collapseBtn *chip
+	pageBox     *walk.Composite
+	tabsRow     *walk.Composite
+	seekRowW    *walk.Composite
+	ctlRowW     *walk.Composite
+	queuePin    int
+	lyricsPin   int
+	seekW       *seekBar
+	progFrac    float64
+	volSlider   *walk.Slider
+	shufBtn     *chip
+	repBtn      *chip
 
 	queuePage *queuePage
 	lyrPage   *lyricsPage
@@ -101,12 +124,21 @@ type app struct {
 	errUntil    time.Time
 	dispPosMs   int64
 	lastTick    time.Time
-	expanded    bool
-	animating   bool
 	activeTab   string
 	allowClose  bool
 	volSentAt   time.Time
 	lyricsReqID int
+
+	// pill / full mode machine
+	mode          string // "pill" or "full"
+	curBarH       int
+	manualOpen    bool
+	everConn      bool
+	hoverIn       bool
+	hoverOutAt    time.Time
+	holdFullUntil time.Time
+	holdPillUntil time.Time
+	seeking       bool
 }
 
 func main() {
@@ -117,6 +149,7 @@ func main() {
 		cfgPath:   cfgPath,
 		cl:        client.New(cfg),
 		activeTab: "queue",
+		mode:      "pill",
 	}
 	if err := a.buildWindow(); err != nil {
 		fmt.Fprintln(os.Stderr, "window:", err)
@@ -124,12 +157,15 @@ func main() {
 	}
 	a.buildTray()
 	if !cfg.Ready() {
-		a.setExpanded(true)
+		a.holdFullUntil = time.Now().Add(24 * time.Hour)
+		a.manualOpen = true
 		a.showTab("settings")
 		a.setPage.setStatus("Enter your relay URL, relay token and the remote PIN, then Save.")
 	}
+	a.evaluateMode()
 	go a.pollLoop()
 	go a.tickLoop()
+	go a.hoverLoop()
 	a.mw.Run()
 }
 
@@ -154,10 +190,9 @@ func (a *app) buildWindow() error {
 	if err != nil {
 		return err
 	}
-	a.barBox = bar.box
+	a.bar = bar
 	a.titleLbl = bar.title
 	a.subLbl = bar.sub
-	a.playBtn = bar.play
 	a.timeLbl = bar.time
 
 	exp, err := a.buildExpanded(mw)
@@ -167,11 +202,8 @@ func (a *app) buildWindow() error {
 	a.expBox = exp
 	exp.SetVisible(false)
 
-	a.mw.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
-		debugLog(fmt.Sprintf("mw raw mousedown btn=%d at %d,%d", int(button), x, y))
-	})
-	a.barBox.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
-		debugLog(fmt.Sprintf("bar raw mousedown btn=%d at %d,%d", int(button), x, y))
+	mw.MouseUp().Attach(func(x, y int, button walk.MouseButton) {
+		a.seeking = false
 	})
 	a.restyleWindow()
 	a.placeTopCenter(collapsedH)
@@ -236,7 +268,7 @@ func (a *app) buildTray() {
 		_ = menu.Actions().Add(act)
 	}
 	addItem("Show / hide", func() { a.toggleVisible() })
-	addItem("Expand / collapse", func() { a.setExpanded(!a.expanded) })
+	addItem("Expand / collapse", func() { a.setExpanded(a.mode != "full") })
 	addItem("Exit", func() {
 		a.allowClose = true
 		if a.ni != nil {
@@ -277,46 +309,172 @@ func loadIcon() *walk.Icon {
 	return icon
 }
 
-// ── expand / collapse ───────────────────────────────────────────────
+// ── pill / full mode machine ────────────────────────────────────────
+//
+// With auto-collapse on (the default), the notch is a slim pill
+// while the mouse is elsewhere and opens to the full window when
+// hovered. With it off, the chevron / tray toggles it manually.
+// Temporary holds let explicit actions (first-run setup, the tray
+// toggle) override the hover logic for a while.
 
+// setExpanded is the manual control: chevron, collapse chip, tray.
 func (a *app) setExpanded(on bool) {
-	if a.animating || on == a.expanded {
+	a.manualOpen = on
+	if a.cl.Config().AutoCollapseOn() {
+		if on {
+			a.holdFullUntil = time.Now().Add(30 * time.Second)
+			a.holdPillUntil = time.Time{}
+		} else {
+			a.holdPillUntil = time.Now().Add(30 * time.Second)
+			a.holdFullUntil = time.Time{}
+		}
+	}
+	a.evaluateMode()
+}
+
+func (a *app) onSettingsSaved() {
+	a.holdFullUntil = time.Time{}
+	a.evaluateMode()
+}
+
+func (a *app) hoverLoop() {
+	hwnd := uintptr(a.mw.Handle())
+	for {
+		var pt winPoint
+		var rc winRect
+		procCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+		procWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+		bottom := rc.Bottom
+		a.mu.Lock()
+		mode, barH := a.mode, a.curBarH
+		a.mu.Unlock()
+		if mode == "pill" && barH > 0 {
+			// The window's frame can be taller than the visible
+			// (region-clipped) pill; hover only counts over the
+			// pill itself, with a little slack for the frame.
+			if b := rc.Top + int32(barH) + 24; b < bottom {
+				bottom = b
+			}
+		}
+		inside := pt.X >= rc.Left && pt.X < rc.Right && pt.Y >= rc.Top && pt.Y < bottom
+		a.mu.Lock()
+		if inside != a.hoverIn {
+			a.hoverIn = inside
+			if !inside {
+				a.hoverOutAt = time.Now()
+			}
+		}
+		a.mu.Unlock()
+		a.mw.Synchronize(func() {
+			a.pollChipHover(pt)
+			a.evaluateMode()
+		})
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// interactionGuard reports whether the user is mid-interaction, in
+// which case the window must not collapse under them: an active
+// seek drag, or typing in a Settings field. (A plain "our window
+// has focus" check would be wrong here — a topmost utility keeps
+// focus after any click, and auto-collapse would never engage.)
+func (a *app) interactionGuard() bool {
+	if a.seeking {
+		return true
+	}
+	focus, _, _ := procGetFocus.Call()
+	if focus == 0 || a.setPage == nil {
+		return false
+	}
+	for _, ed := range []*walk.LineEdit{
+		a.setPage.urlEd, a.setPage.tokEd, a.setPage.pinEd,
+		a.setPage.nameEd, a.setPage.delayEd,
+	} {
+		if ed != nil && focus == uintptr(ed.Handle()) {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluateMode resolves the current target mode and applies it.
+// Runs on the UI thread.
+func (a *app) evaluateMode() {
+	cfg := a.cl.Config()
+	now := time.Now()
+	full := false
+	switch {
+	case now.Before(a.holdFullUntil):
+		full = true
+	case now.Before(a.holdPillUntil):
+		full = false
+	case !cfg.AutoCollapseOn():
+		full = a.manualOpen
+	case !a.everConn:
+		full = true
+	default:
+		a.mu.Lock()
+		hover, outAt := a.hoverIn, a.hoverOutAt
+		a.mu.Unlock()
+		if hover || a.interactionGuard() {
+			full = true
+		} else if a.mode == "full" && now.Sub(outAt) < cfg.CollapseDelay() {
+			full = true // grace period before collapsing
+		}
+	}
+	target := "pill"
+	if full {
+		target = "full"
+	}
+	a.applyMode(target, cfg)
+}
+
+func (a *app) applyMode(target string, cfg client.Config) {
+	auto := cfg.AutoCollapseOn()
+	isFull := target == "full"
+	// Bar affordances per mode.
+	a.bar.chev.setVisible(!isFull && !auto)
+	a.collapseBtn.setVisible(isFull && !auto)
+	controls := isFull || cfg.PillControlsOn()
+	a.bar.prev.setVisible(controls)
+	a.bar.play.setVisible(controls)
+	a.bar.next.setVisible(controls)
+	strip := !isFull && cfg.PillProgressOn()
+	a.bar.strip.cw.SetVisible(strip)
+	barH := collapsedH
+	if strip {
+		barH += stripH
+	}
+	a.curBarH = barH
+	a.bar.wrap.SetMinMaxSize(walk.Size{Width: notchW, Height: barH},
+		walk.Size{Width: notchW, Height: barH})
+
+	// While in pill mode the page host must not impose its fixed
+	// height: walk floors the window size at the layout's minimum,
+	// and a 322-tall page box would keep the pill 500 tall.
+	if isFull {
+		a.pageBox.SetMinMaxSize(walk.Size{Width: notchW - 20, Height: pageH},
+			walk.Size{Width: notchW - 20, Height: pageH})
+	} else {
+		a.pageBox.SetMinMaxSize(walk.Size{Width: notchW - 20, Height: 0},
+			walk.Size{Width: notchW - 20, Height: 0})
+	}
+	if target == a.mode {
 		return
 	}
-	a.expanded = on
-	if on {
+	a.mode = target
+	if isFull {
 		a.expBox.SetVisible(true)
+		a.placeTopCenter(expandedH)
+		a.roundCorners(expandedH)
+	} else {
+		a.placeTopCenter(barH)
+		a.roundCorners(barH)
+		a.expBox.SetVisible(false)
 	}
-	a.animating = true
-	target := collapsedH
-	if on {
-		target = expandedH
-	}
-	go func() {
-		cur := a.mw.Bounds().Height
-		for {
-			step := (target - cur) / 3
-			if step == 0 {
-				step = target - cur
-			}
-			cur += step
-			done := cur == target
-			a.mw.Synchronize(func() {
-				a.placeTopCenter(cur)
-				a.roundCorners(cur)
-			})
-			if done {
-				break
-			}
-			time.Sleep(14 * time.Millisecond)
-		}
-		a.mw.Synchronize(func() {
-			a.animating = false
-			if !a.expanded {
-				a.expBox.SetVisible(false)
-			}
-		})
-	}()
+	// Without this, the bar's painted widgets can stay stale after
+	// the shrink under some environments.
+	win.InvalidateRect(a.mw.Handle(), nil, true)
 }
 
 func (a *app) showTab(name string) {
@@ -324,7 +482,7 @@ func (a *app) showTab(name string) {
 	a.queuePage.box.SetVisible(name == "queue")
 	a.lyrPage.box.SetVisible(name == "lyrics")
 	a.setPage.box.SetVisible(name == "settings")
-	for n, b := range map[string]*lblBtn{
+	for n, b := range map[string]*chip{
 		"queue": a.tabQueue, "lyrics": a.tabLyr, "settings": a.tabSet,
 	} {
 		b.setActive(n == name)
@@ -351,6 +509,7 @@ func (a *app) pollOnce() {
 	if err == nil {
 		a.state = st
 		a.dispPosMs = st.PositionMs
+		a.everConn = true
 	}
 	a.mu.Unlock()
 	a.mw.Synchronize(func() { a.applyState(err) })
@@ -394,13 +553,15 @@ func (a *app) applyState(pollErr error) {
 	if pollErr != nil {
 		a.titleLbl.SetText("BitChord — not connected")
 		a.subLbl.SetText(shortErr(pollErr))
-		a.playBtn.setText("▶")
+		a.subLbl.SetTextColor(colDanger)
+		a.bar.play.setText("▶")
 		return
 	}
 	if st == nil || st.Current == nil {
 		a.titleLbl.SetText("BitChord — nothing playing")
 		a.subLbl.SetText("Open a song on the phone")
-		a.playBtn.setText("▶")
+		a.subLbl.SetTextColor(colMuted)
+		a.bar.play.setText("▶")
 		a.timeLbl.SetText("")
 		a.queuePage.applyState(st)
 		return
@@ -412,12 +573,15 @@ func (a *app) applyState(pollErr error) {
 	}
 	if a.errText != "" && time.Now().Before(a.errUntil) {
 		artist = "⚠ " + a.errText
+		a.subLbl.SetTextColor(colDanger)
+	} else {
+		a.subLbl.SetTextColor(colMuted)
 	}
 	a.subLbl.SetText(artist)
 	if st.Playing {
-		a.playBtn.setText("❚❚")
+		a.bar.play.setText("❚❚")
 	} else {
-		a.playBtn.setText("▶")
+		a.bar.play.setText("▶")
 	}
 	a.updateProgress(a.dispPosMs)
 	// Volume slider follows the phone unless the user just moved it.
@@ -425,6 +589,7 @@ func (a *app) applyState(pollErr error) {
 		time.Since(a.volSentAt) > 2*time.Second {
 		a.volSlider.SetValue((*st.Volume) * 100 / (*st.VolumeMax))
 	}
+	a.relayout()
 	a.shufBtn.setActive(st.Shuffle)
 	a.repBtn.setText(repeatLabel(st.Repeat))
 	a.repBtn.setActive(st.Repeat != 0)
@@ -439,15 +604,64 @@ func (a *app) updateProgress(posMs int64) {
 		return
 	}
 	dur := st.DurationMs
+	frac := 0.0
 	if dur > 0 {
-		a.progBar.SetRange(0, int(dur/1000))
-		p := int(posMs / 1000)
-		if p > int(dur/1000) {
-			p = int(dur / 1000)
+		frac = float64(posMs) / float64(dur)
+		if frac > 1 {
+			frac = 1
 		}
-		a.progBar.SetValue(p)
+	}
+	a.progFrac = frac
+	if a.seekW != nil {
+		a.seekW.invalidate()
+	}
+	if a.bar != nil && a.bar.strip.cw.Visible() {
+		a.bar.strip.invalidate()
 	}
 	a.timeLbl.SetText(fmt.Sprintf("%s / %s", fmtMs(posMs), fmtMs(dur)))
+}
+
+// seekGesture handles clicks and drags on the painted seek bar;
+// x is in the bar's own coordinates.
+func (a *app) seekGesture(x, width int, down bool) {
+	if width <= 0 {
+		return
+	}
+	frac := float64(x) / float64(width)
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	a.mu.Lock()
+	st := a.state
+	a.mu.Unlock()
+	if st == nil || st.DurationMs <= 0 {
+		return
+	}
+	if down {
+		a.seeking = true
+	} else if !a.seeking {
+		return
+	}
+	ms := int64(frac * float64(st.DurationMs))
+	a.cmd(func(ctx context.Context) error { return a.cl.Seek(ctx, ms) })
+}
+
+// pollChipHover refreshes chip hover states from the real cursor
+// position and each chip's real window rectangle.
+func (a *app) pollChipHover(pt winPoint) {
+	for _, c := range a.chips {
+		if !c.cw.Visible() {
+			c.setHovered(false)
+			continue
+		}
+		var rc winRect
+		procWindowRect.Call(uintptr(c.cw.Handle()), uintptr(unsafe.Pointer(&rc)))
+		inside := pt.X >= rc.Left && pt.X < rc.Right && pt.Y >= rc.Top && pt.Y < rc.Bottom
+		c.setHovered(inside)
+	}
 }
 
 // ── commands (fire-and-forget from UI handlers) ─────────────────────
@@ -532,4 +746,43 @@ func repeatLabel(r int) string {
 	default:
 		return "Repeat: off"
 	}
+}
+
+// relayout pins the two list boxes to the space actually left over
+// by the fixed rows at the current DPI, instead of trusting the
+// design-time arithmetic — at 150%+ scaling the rows grow a little
+// and a statically-sized list pushes the footer off the window.
+func (a *app) relayout() {
+	if a.mode != "full" || a.tabsRow == nil {
+		return
+	}
+	expH := a.expBox.Size().Height
+	if expH < 200 {
+		return
+	}
+	fixed := a.tabsRow.Size().Height + a.seekRowW.Size().Height +
+		a.ctlRowW.Size().Height + 12 + 18 // exp margins + spacing
+	pageAvail := expH - fixed
+	if pageAvail < 120 {
+		return
+	}
+	if a.queuePage != nil && a.queuePage.actions != nil {
+		if h := pageAvail - a.queuePage.actions.Size().Height - 6; h > 60 && absDiff(h, a.queuePin) > 2 {
+			a.queuePin = h
+			pinListHeight(a.queuePage.list, h)
+		}
+	}
+	if a.lyrPage != nil {
+		if h := pageAvail - 24; h > 60 && absDiff(h, a.lyricsPin) > 2 {
+			a.lyricsPin = h
+			pinListHeight(a.lyrPage.list, h)
+		}
+	}
+}
+
+func absDiff(a, b int) int {
+	if a < b {
+		return b - a
+	}
+	return a - b
 }
